@@ -38,10 +38,25 @@ Options:
 
 ### Postfix Integration
 
-Add the following to `/etc/postfix/main.cf`:
+**Option A: Global Fallback Relay**
+Add to `/etc/postfix/main.cf`:
 
 ```postfix
 lmtp_fallback_relay = 127.0.0.1:2526
+```
+
+**Option B: Destination-Specific Transport Fallback (Recommended)**
+Add to `/etc/postfix/master.cf`:
+
+```postfix
+roundcube-lmtp unix - - y - - lmtp
+  -o lmtp_fallback_relay=127.0.0.1:2526
+```
+
+And in `/etc/postfix/transport`:
+
+```postfix
+roundcube.jphq.net    roundcube-lmtp:10.7.1.3:24
 ```
 
 Then reload Postfix (`postfix reload`).
@@ -60,9 +75,10 @@ Then reload Postfix (`postfix reload`).
 
 ### Draining Invariants & Rules
 
+- **Initial Downstream Check**: Validates downstream LMTP availability (`220` greeting & `LHLO`) before modifying or renaming any spool records.
 - **Single-Instance Locking**: Uses non-blocking `flock` on `/var/spool/lmtp-sink/.drain.lock`. If another drain process is active, it exits immediately without doing work.
-- **Network Failure Retention**: If a network error or connection failure occurs, processing aborts immediately and remaining records stay `.spool` to be retried on the next scheduled run.
-- **Rejection Handling**: Downstream LMTP rejection (`4xx`/`5xx`) or malformed headers renames the file to `.failed` and proceeds to the next record.
+- **Network Failure Retention**: If a network error or socket I/O failure occurs, processing aborts immediately and remaining records stay `.spool` to be retried on the next scheduled run.
+- **Rejection & Protocol Failure Handling**: Downstream LMTP rejection (`4xx`/`5xx`), malformed protocol responses, or malformed record headers cause the file to be renamed to `.failed`, after which processing continues with the next record.
 - **Dot-Stuffing**: Automatically re-applies LMTP dot-stuffing (`.` -> `..`) when streaming message payload to the downstream host.
 
 ### `lmtp-drain` Usage
@@ -72,9 +88,9 @@ lmtp-drain [options]
 
 Options:
   -s, --spool-dir <path>       Spool directory (default: /var/spool/lmtp-sink)
-  -H, --host <host-or-address> LMTP host (default: 127.0.0.1)
+  -H, --host <host-or-address> LMTP host (default: 10.7.1.3)
   -p, --port <port>            LMTP port (default: 24)
-  -n, --lhlo-name <name>       Client LHLO hostname (default: localhost)
+  -n, --lhlo-name <name>       Client LHLO hostname (default: mail.jacobstoner.com)
   -h, --help                   Show help message
 ```
 
@@ -83,7 +99,7 @@ Options:
 Add a cron entry to run `lmtp-drain` periodically (e.g. every 5 minutes):
 
 ```cron
-*/5 * * * * /usr/local/sbin/lmtp-drain --spool-dir /var/spool/lmtp-sink --host 127.0.0.1 --port 24 --lhlo-name localhost
+*/5 * * * * /usr/local/sbin/lmtp-drain --spool-dir /var/spool/lmtp-sink --host 10.7.1.3 --port 24 --lhlo-name mail.jacobstoner.com
 ```
 
 ---
@@ -94,8 +110,8 @@ Spool files reside in `/var/spool/lmtp-sink/`:
 
 ```text
 MAIL FROM:<sender@example.org> SIZE=12345 BODY=8BITMIME
-RCPT TO:<jacob@example.org>
-RCPT TO:<support@example.org>
+RCPT TO:<jacob@roundcube.jphq.net>
+RCPT TO:<support@roundcube.jphq.net>
 RECEIVED AT:2026-03-21T04:15:23.123456Z
 
 [unescaped message bytes]

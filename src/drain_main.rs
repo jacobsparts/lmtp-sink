@@ -2,7 +2,6 @@ use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process;
@@ -20,9 +19,9 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             spool_dir: PathBuf::from("/var/spool/lmtp-sink"),
-            host: "127.0.0.1".to_string(),
+            host: "10.7.1.3".to_string(),
             port: 24,
-            lhlo_name: "localhost".to_string(),
+            lhlo_name: "mail.jacobstoner.com".to_string(),
         }
     }
 }
@@ -76,9 +75,9 @@ fn parse_args() -> Config {
                 println!("Usage: lmtp-drain [options]");
                 println!("Options:");
                 println!("  -s, --spool-dir <path>       Spool directory (default: /var/spool/lmtp-sink)");
-                println!("  -H, --host <host-or-address> LMTP host (default: 127.0.0.1)");
+                println!("  -H, --host <host-or-address> LMTP host (default: 10.7.1.3)");
                 println!("  -p, --port <port>            LMTP port (default: 24)");
-                println!("  -n, --lhlo-name <name>       Client LHLO hostname (default: localhost)");
+                println!("  -n, --lhlo-name <name>       Client LHLO hostname (default: mail.jacobstoner.com)");
                 println!("  -h, --help                   Show this help message");
                 process::exit(0);
             }
@@ -259,6 +258,21 @@ fn mark_record_failed(spool_path: &Path) -> Result<(), String> {
     })
 }
 
+#[derive(Debug)]
+enum ResponseError {
+    Network(String),
+    Protocol(String),
+}
+
+impl std::fmt::Display for ResponseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ResponseError::Network(s) => write!(f, "{}", s),
+            ResponseError::Protocol(s) => write!(f, "{}", s),
+        }
+    }
+}
+
 struct LmtpClient {
     stream: TcpStream,
     reader: BufReader<TcpStream>,
@@ -296,16 +310,17 @@ impl LmtpClient {
         Ok(client)
     }
 
-    fn read_response(&mut self) -> Result<(u16, String), String> {
+    fn read_response(&mut self) -> Result<(u16, String), ResponseError> {
         let mut full_resp = String::new();
         loop {
             let mut line = String::new();
-            let n = self
-                .reader
-                .read_line(&mut line)
-                .map_err(|e| format!("Network error reading LMTP response: {}", e))?;
+            let n = self.reader.read_line(&mut line).map_err(|e| {
+                ResponseError::Network(format!("Network error reading LMTP response: {}", e))
+            })?;
             if n == 0 {
-                return Err("Network error: unexpected EOF reading response".to_string());
+                return Err(ResponseError::Network(
+                    "Network error: unexpected EOF reading response".to_string(),
+                ));
             }
 
             full_resp.push_str(&line);
@@ -320,12 +335,17 @@ impl LmtpClient {
                     }
                 }
             }
-            return Err(format!("Malformed LMTP response: {}", line));
+            return Err(ResponseError::Protocol(format!(
+                "Malformed LMTP response: {}",
+                line.trim()
+            )));
         }
     }
 
     fn handshake(&mut self, lhlo_name: &str) -> Result<(), String> {
-        let (code, greeting) = self.read_response()?;
+        let (code, greeting) = self
+            .read_response()
+            .map_err(|e| format!("Downstream greeting error: {}", e))?;
         if code != 220 {
             return Err(format!("Downstream rejected greeting: {}", greeting.trim()));
         }
@@ -338,7 +358,9 @@ impl LmtpClient {
             .flush()
             .map_err(|e| format!("Network error flushing LHLO: {}", e))?;
 
-        let (code, resp) = self.read_response()?;
+        let (code, resp) = self
+            .read_response()
+            .map_err(|e| format!("Downstream LHLO response error: {}", e))?;
         if code != 250 {
             return Err(format!("Downstream rejected LHLO: {}", resp.trim()));
         }
@@ -373,7 +395,8 @@ fn deliver_record(
                 return DeliverResult::LmtpRejected(format!("MAIL FROM rejected: {}", resp.trim()));
             }
         }
-        Err(e) => return DeliverResult::NetworkError(e),
+        Err(ResponseError::Protocol(msg)) => return DeliverResult::LmtpRejected(msg),
+        Err(ResponseError::Network(msg)) => return DeliverResult::NetworkError(msg),
     }
 
     // 2. RCPT TO
@@ -396,7 +419,8 @@ fn deliver_record(
                     ));
                 }
             }
-            Err(e) => return DeliverResult::NetworkError(e),
+            Err(ResponseError::Protocol(msg)) => return DeliverResult::LmtpRejected(msg),
+            Err(ResponseError::Network(msg)) => return DeliverResult::NetworkError(msg),
         }
     }
 
@@ -414,7 +438,8 @@ fn deliver_record(
                 return DeliverResult::LmtpRejected(format!("DATA rejected: {}", resp.trim()));
             }
         }
-        Err(e) => return DeliverResult::NetworkError(e),
+        Err(ResponseError::Protocol(msg)) => return DeliverResult::LmtpRejected(msg),
+        Err(ResponseError::Network(msg)) => return DeliverResult::NetworkError(msg),
     }
 
     // 4. Stream Message Body
@@ -515,7 +540,14 @@ fn deliver_record(
                     reject_msg.push_str(resp.trim());
                 }
             }
-            Err(e) => return DeliverResult::NetworkError(e),
+            Err(ResponseError::Protocol(msg)) => {
+                all_ok = false;
+                if !reject_msg.is_empty() {
+                    reject_msg.push_str("; ");
+                }
+                reject_msg.push_str(&msg);
+            }
+            Err(ResponseError::Network(msg)) => return DeliverResult::NetworkError(msg),
         }
     }
 
@@ -568,6 +600,18 @@ fn main() {
 
     let destination_str = format!("{}:{}", config.host, config.port);
 
+    // Section 11: Establish and validate initial downstream LMTP connection BEFORE processing any records
+    let mut initial_client = match LmtpClient::connect(&config) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            eprintln!(
+                "Downstream LMTP host {} unavailable ({}); aborting without modifying records",
+                destination_str, e
+            );
+            process::exit(1);
+        }
+    };
+
     for record_path in records {
         let filename = record_path.file_name().unwrap().to_str().unwrap();
 
@@ -594,16 +638,19 @@ fn main() {
             }
         };
 
-        // Connect & delivery
-        let mut client = match LmtpClient::connect(&config) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!(
-                    "Record {:?}: network error ({}); retained as .spool; aborting",
-                    filename, e
-                );
-                process::exit(1);
-            }
+        // Use pre-validated initial connection for first valid record, or connect anew
+        let mut client = match initial_client.take() {
+            Some(c) => c,
+            None => match LmtpClient::connect(&config) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!(
+                        "Record {:?}: network error ({}); retained as .spool; aborting",
+                        filename, e
+                    );
+                    process::exit(1);
+                }
+            },
         };
 
         match deliver_record(&mut client, &record_path, &parsed) {
@@ -826,6 +873,31 @@ mod tests {
             .spool_dir
             .join("20260321T041523123456Z.failed")
             .exists());
+
+        let _ = fs::remove_dir_all(&config.spool_dir);
+    }
+
+    #[test]
+    fn test_malformed_lmtp_response_becomes_rejected() {
+        let behavior = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (config, _addr, _handle) = setup_mock_dovecot(behavior.clone());
+
+        let sample_path = Path::new("sample.spool");
+        let parsed = parse_record(sample_path).unwrap().unwrap();
+
+        let spool_file = config.spool_dir.join("20260321T041523123456Z.spool");
+        fs::copy(sample_path, &spool_file).unwrap();
+
+        let mut client = LmtpClient::connect(&config).unwrap();
+
+        // Push non-LMTP response for MAIL FROM
+        behavior
+            .lock()
+            .unwrap()
+            .push("this is not LMTP\r\n".to_string());
+
+        let res = deliver_record(&mut client, &spool_file, &parsed);
+        assert!(matches!(res, DeliverResult::LmtpRejected(_)));
 
         let _ = fs::remove_dir_all(&config.spool_dir);
     }
