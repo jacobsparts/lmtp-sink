@@ -82,7 +82,9 @@ fn parse_args() -> Config {
                 println!("  -l, --listen-addr <addr>     Listen address (default: 127.0.0.1)");
                 println!("  -p, --listen-port <port>     Listen port (default: 2526)");
                 println!("  -s, --spool-dir <path>       Spool directory (default: /var/spool/lmtp-sink)");
-                println!("  -m, --min-free-bytes <bytes> Min free bytes required (default: 104857600)");
+                println!(
+                    "  -m, --min-free-bytes <bytes> Min free bytes required (default: 104857600)"
+                );
                 println!("  -h, --help                   Show this help message");
                 process::exit(0);
             }
@@ -109,6 +111,7 @@ fn get_available_bytes(path: &Path) -> io::Result<u64> {
     } else {
         stat.f_bsize
     };
+    #[allow(clippy::unnecessary_cast)]
     Ok((stat.f_bavail as u64) * (block_size as u64))
 }
 
@@ -221,7 +224,9 @@ fn handle_connection(mut stream: TcpStream, config: &Config) -> io::Result<()> {
                 stream.flush()?;
             }
             "RCPT" => {
-                if session_state != SessionState::MailReceived && session_state != SessionState::RcptReceived {
+                if session_state != SessionState::MailReceived
+                    && session_state != SessionState::RcptReceived
+                {
                     stream.write_all(b"503 5.5.1 Bad sequence of commands\r\n")?;
                     stream.flush()?;
                     continue;
@@ -293,12 +298,17 @@ fn handle_connection(mut stream: TcpStream, config: &Config) -> io::Result<()> {
                         }
                         stream.flush()?;
                     }
-                    Err(e) => {
-                        eprintln!("Failed to store message: {}", e);
+                    Err(DataError::PostData(e)) => {
+                        eprintln!("Failed to store message after DATA terminator: {}", e);
                         for _ in &tx.rcpt_to_args {
                             stream.write_all(b"451 4.3.0 Unable to store message\r\n")?;
                         }
                         stream.flush()?;
+                    }
+                    Err(DataError::MidData(e)) => {
+                        eprintln!("Error during DATA transfer ({}), closing connection", e);
+                        tx.reset();
+                        break;
                     }
                 }
 
@@ -327,7 +337,7 @@ fn handle_connection(mut stream: TcpStream, config: &Config) -> io::Result<()> {
                 stream.write_all(b"502 5.5.1 Command not implemented\r\n")?;
                 stream.flush()?;
             }
-_ => {
+            _ => {
                 stream.write_all(b"502 5.5.1 Command not implemented\r\n")?;
                 stream.flush()?;
             }
@@ -340,17 +350,23 @@ _ => {
     Ok(())
 }
 
+#[derive(Debug)]
+enum DataError {
+    MidData(io::Error),
+    PostData(io::Error),
+}
+
 fn receive_and_store_data<R: BufRead>(
     reader: &mut R,
     tx: &TransactionState,
     config: &Config,
-) -> io::Result<String> {
+) -> Result<String, DataError> {
     let now = Utc::now();
     let iso8601_time = now.format("%Y-%m-%dT%H:%M:%S.%6fZ").to_string();
 
     let mail_from = tx.mail_from_arg.as_deref().unwrap_or("<>");
 
-    // Exclusive create of temp file
+    // Exclusive create of temp file + ensure final .spool path does not exist
     let mut retries = 0;
     let (temp_path, spool_filename, spool_path, mut temp_file) = loop {
         let ts_now = Utc::now();
@@ -361,6 +377,18 @@ fn receive_and_store_data<R: BufRead>(
         let tmp_path = config.spool_dir.join(&tmp_name);
         let final_path = config.spool_dir.join(&final_name);
 
+        if final_path.exists() {
+            retries += 1;
+            if retries > 100 {
+                return Err(DataError::PostData(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "Failed to generate unique spool filename",
+                )));
+            }
+            std::thread::sleep(std::time::Duration::from_micros(10));
+            continue;
+        }
+
         match OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -370,19 +398,19 @@ fn receive_and_store_data<R: BufRead>(
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                 retries += 1;
                 if retries > 100 {
-                    return Err(io::Error::new(
+                    return Err(DataError::PostData(io::Error::new(
                         io::ErrorKind::AlreadyExists,
-                        "Failed to generate unique filename",
-                    ));
+                        "Failed to generate unique temp filename",
+                    )));
                 }
                 std::thread::sleep(std::time::Duration::from_micros(10));
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(DataError::PostData(e)),
         }
     };
 
-    let mut inner = |temp_file: &mut File| -> io::Result<()> {
-        // Write envelope preamble
+    // Phase 1: Write preamble & read message data from client socket until terminator line
+    let phase1_res = (|| -> io::Result<()> {
         writeln!(temp_file, "MAIL FROM:{}", mail_from)?;
         for rcpt in &tx.rcpt_to_args {
             writeln!(temp_file, "RCPT TO:{}", rcpt)?;
@@ -390,7 +418,6 @@ fn receive_and_store_data<R: BufRead>(
         writeln!(temp_file, "RECEIVED AT:{}", iso8601_time)?;
         writeln!(temp_file)?; // Empty line separating preamble and body
 
-        // Write unescaped message bytes line-by-line
         let mut data_buf = Vec::new();
         loop {
             data_buf.clear();
@@ -402,12 +429,10 @@ fn receive_and_store_data<R: BufRead>(
                 ));
             }
 
-            // Check for end-of-data terminator line: .\r\n or .\n
             if data_buf == b".\r\n" || data_buf == b".\n" {
                 break;
             }
 
-            // Dot-stuffing removal
             let payload = if data_buf.starts_with(b"..") {
                 &data_buf[1..]
             } else {
@@ -416,26 +441,30 @@ fn receive_and_store_data<R: BufRead>(
 
             temp_file.write_all(payload)?;
         }
+        Ok(())
+    })();
 
+    if let Err(e) = phase1_res {
+        drop(temp_file);
+        let _ = fs::remove_file(&temp_path);
+        return Err(DataError::MidData(e));
+    }
+
+    // Phase 2: Flush, fsync, close, atomic rename, and directory fsync
+    let phase2_res = (|| -> io::Result<()> {
         temp_file.flush()?;
         temp_file.sync_all()?;
+        drop(temp_file);
+
+        fs::rename(&temp_path, &spool_path)?;
+        sync_dir(&config.spool_dir)?;
         Ok(())
-    };
+    })();
 
-    let res = inner(&mut temp_file);
-    drop(temp_file); // Ensure file handle is closed before rename/remove
-
-if let Err(e) = res {
+    if let Err(e) = phase2_res {
         let _ = fs::remove_file(&temp_path);
-        Err(e)
+        Err(DataError::PostData(e))
     } else {
-        if let Err(e) = fs::rename(&temp_path, &spool_path) {
-            let _ = fs::remove_file(&temp_path);
-            return Err(e);
-        }
-        if let Err(e) = sync_dir(&config.spool_dir) {
-            return Err(e);
-        }
         Ok(spool_filename)
     }
 }
@@ -479,7 +508,6 @@ fn main() {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,10 +532,8 @@ mod tests {
 
         let server_config = config.clone();
         thread::spawn(move || {
-            for stream in listener.incoming() {
-                if let Ok(stream) = stream {
-                    let _ = handle_connection(stream, &server_config);
-                }
+            for stream in listener.incoming().flatten() {
+                let _ = handle_connection(stream, &server_config);
             }
         });
 
@@ -529,8 +555,12 @@ mod tests {
         assert!(line.starts_with("220 "));
 
         // LHLO
-        writer.write_all(b"LHLO client.example.com
-").unwrap();
+        writer
+            .write_all(
+                b"LHLO client.example.com
+",
+            )
+            .unwrap();
         line.clear();
         reader.read_line(&mut line).unwrap();
         assert!(line.starts_with("250-"));
@@ -539,55 +569,83 @@ mod tests {
         assert!(line.starts_with("250 "));
 
         // MAIL FROM
-        writer.write_all(b"MAIL FROM:<sender@example.com> SIZE=100
-").unwrap();
+        writer
+            .write_all(
+                b"MAIL FROM:<sender@example.com> SIZE=100
+",
+            )
+            .unwrap();
         line.clear();
         reader.read_line(&mut line).unwrap();
         assert!(line.starts_with("250 "));
 
         // RCPT TO 1
-        writer.write_all(b"RCPT TO:<rcpt1@example.com>
-").unwrap();
+        writer
+            .write_all(
+                b"RCPT TO:<rcpt1@example.com>
+",
+            )
+            .unwrap();
         line.clear();
         reader.read_line(&mut line).unwrap();
         assert!(line.starts_with("250 "));
 
         // RCPT TO 2
-        writer.write_all(b"RCPT TO:<rcpt2@example.com> NOTIFY=FAILURE
-").unwrap();
+        writer
+            .write_all(
+                b"RCPT TO:<rcpt2@example.com> NOTIFY=FAILURE
+",
+            )
+            .unwrap();
         line.clear();
         reader.read_line(&mut line).unwrap();
         assert!(line.starts_with("250 "));
 
         // DATA
-        writer.write_all(b"DATA
-").unwrap();
+        writer
+            .write_all(
+                b"DATA
+",
+            )
+            .unwrap();
         line.clear();
         reader.read_line(&mut line).unwrap();
         assert!(line.starts_with("354 "));
 
         // Send message content with dot stuffing
-        writer.write_all(b"From: sender@example.com
+        writer
+            .write_all(
+                b"From: sender@example.com
 Subject: Test
 
 ..Leading dot
 Normal line
 .
-").unwrap();
+",
+            )
+            .unwrap();
 
         // Expect 2 x 250 responses (one per recipient)
         line.clear();
         reader.read_line(&mut line).unwrap();
         assert!(line.starts_with("250 2.0.0 Stored as "));
-        let spool_name1 = line.trim().strip_prefix("250 2.0.0 Stored as ").unwrap().to_string();
+        let spool_name1 = line
+            .trim()
+            .strip_prefix("250 2.0.0 Stored as ")
+            .unwrap()
+            .to_string();
 
         line.clear();
         reader.read_line(&mut line).unwrap();
         assert!(line.starts_with("250 2.0.0 Stored as "));
 
         // QUIT
-        writer.write_all(b"QUIT
-").unwrap();
+        writer
+            .write_all(
+                b"QUIT
+",
+            )
+            .unwrap();
         line.clear();
         reader.read_line(&mut line).unwrap();
         assert!(line.starts_with("221 "));
@@ -597,16 +655,24 @@ Normal line
         assert!(spool_path.exists());
 
         let contents = fs::read_to_string(&spool_path).unwrap();
-        assert!(contents.contains("MAIL FROM:<sender@example.com> SIZE=100
-"));
-        assert!(contents.contains("RCPT TO:<rcpt1@example.com>
-"));
-        assert!(contents.contains("RCPT TO:<rcpt2@example.com> NOTIFY=FAILURE
-"));
+        assert!(contents.contains(
+            "MAIL FROM:<sender@example.com> SIZE=100
+"
+        ));
+        assert!(contents.contains(
+            "RCPT TO:<rcpt1@example.com>
+"
+        ));
+        assert!(contents.contains(
+            "RCPT TO:<rcpt2@example.com> NOTIFY=FAILURE
+"
+        ));
         assert!(contents.contains("RECEIVED AT:"));
-        assert!(contents.contains(".Leading dot
+        assert!(contents.contains(
+            ".Leading dot
 Normal line
-"));
+"
+        ));
 
         let _ = fs::remove_dir_all(&config.spool_dir);
     }
@@ -621,36 +687,68 @@ Normal line
         let mut line = String::new();
         reader.read_line(&mut line).unwrap(); // 220
 
-        writer.write_all(b"LHLO localhost
-").unwrap();
-        line.clear(); reader.read_line(&mut line).unwrap();
-        line.clear(); reader.read_line(&mut line).unwrap();
+        writer
+            .write_all(
+                b"LHLO localhost
+",
+            )
+            .unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
 
-        writer.write_all(b"MAIL FROM:<>
-").unwrap();
-        line.clear(); reader.read_line(&mut line).unwrap();
+        writer
+            .write_all(
+                b"MAIL FROM:<>
+",
+            )
+            .unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
         assert!(line.starts_with("250 "));
 
-        writer.write_all(b"RCPT TO:<user@example.com>
-").unwrap();
-        line.clear(); reader.read_line(&mut line).unwrap();
+        writer
+            .write_all(
+                b"RCPT TO:<user@example.com>
+",
+            )
+            .unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
         assert!(line.starts_with("250 "));
 
-        writer.write_all(b"DATA
-").unwrap();
-        line.clear(); reader.read_line(&mut line).unwrap();
+        writer
+            .write_all(
+                b"DATA
+",
+            )
+            .unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
         assert!(line.starts_with("354 "));
 
-        writer.write_all(b"Test message
+        writer
+            .write_all(
+                b"Test message
 .
-").unwrap();
-        line.clear(); reader.read_line(&mut line).unwrap();
+",
+            )
+            .unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
         assert!(line.starts_with("250 2.0.0 Stored as "));
-        let spool_name = line.trim().strip_prefix("250 2.0.0 Stored as ").unwrap().to_string();
+        let spool_name = line
+            .trim()
+            .strip_prefix("250 2.0.0 Stored as ")
+            .unwrap()
+            .to_string();
 
         let contents = fs::read_to_string(config.spool_dir.join(spool_name)).unwrap();
-        assert!(contents.contains("MAIL FROM:<>
-"));
+        assert!(contents.contains(
+            "MAIL FROM:<>
+"
+        ));
 
         let _ = fs::remove_dir_all(&config.spool_dir);
     }
@@ -666,22 +764,43 @@ Normal line
         let mut line = String::new();
         reader.read_line(&mut line).unwrap();
 
-        writer.write_all(b"LHLO localhost
-").unwrap();
-        line.clear(); reader.read_line(&mut line).unwrap();
-        line.clear(); reader.read_line(&mut line).unwrap();
+        writer
+            .write_all(
+                b"LHLO localhost
+",
+            )
+            .unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
 
-        writer.write_all(b"MAIL FROM:<a@b.com>
-").unwrap();
-        line.clear(); reader.read_line(&mut line).unwrap();
+        writer
+            .write_all(
+                b"MAIL FROM:<a@b.com>
+",
+            )
+            .unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
 
-        writer.write_all(b"RCPT TO:<c@d.com>
-").unwrap();
-        line.clear(); reader.read_line(&mut line).unwrap();
+        writer
+            .write_all(
+                b"RCPT TO:<c@d.com>
+",
+            )
+            .unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
 
-        writer.write_all(b"DATA
-").unwrap();
-        line.clear(); reader.read_line(&mut line).unwrap();
+        writer
+            .write_all(
+                b"DATA
+",
+            )
+            .unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
         assert!(line.starts_with("452 "));
 
         let _ = fs::remove_dir_all(&config.spool_dir);
@@ -698,26 +817,47 @@ Normal line
         reader.read_line(&mut line).unwrap();
 
         // MAIL FROM before LHLO
-        writer.write_all(b"MAIL FROM:<a@b.com>
-").unwrap();
-        line.clear(); reader.read_line(&mut line).unwrap();
+        writer
+            .write_all(
+                b"MAIL FROM:<a@b.com>
+",
+            )
+            .unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
         assert!(line.starts_with("503 "));
 
-        writer.write_all(b"LHLO localhost
-").unwrap();
-        line.clear(); reader.read_line(&mut line).unwrap();
-        line.clear(); reader.read_line(&mut line).unwrap();
+        writer
+            .write_all(
+                b"LHLO localhost
+",
+            )
+            .unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
 
         // RCPT TO before MAIL FROM
-        writer.write_all(b"RCPT TO:<c@d.com>
-").unwrap();
-        line.clear(); reader.read_line(&mut line).unwrap();
+        writer
+            .write_all(
+                b"RCPT TO:<c@d.com>
+",
+            )
+            .unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
         assert!(line.starts_with("503 "));
 
         // DATA before RCPT TO
-        writer.write_all(b"DATA
-").unwrap();
-        line.clear(); reader.read_line(&mut line).unwrap();
+        writer
+            .write_all(
+                b"DATA
+",
+            )
+            .unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
         assert!(line.starts_with("503 "));
 
         let _ = fs::remove_dir_all(&config.spool_dir);
@@ -733,30 +873,51 @@ Normal line
         let mut line = String::new();
         reader.read_line(&mut line).unwrap();
 
-        writer.write_all(b"LHLO localhost
-").unwrap();
-        line.clear(); reader.read_line(&mut line).unwrap();
-        line.clear(); reader.read_line(&mut line).unwrap();
+        writer
+            .write_all(
+                b"LHLO localhost
+",
+            )
+            .unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
 
-        writer.write_all(b"MAIL FROM:<a@b.com>
-").unwrap();
-        line.clear(); reader.read_line(&mut line).unwrap();
+        writer
+            .write_all(
+                b"MAIL FROM:<a@b.com>
+",
+            )
+            .unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
 
-        writer.write_all(b"RCPT TO:<c@d.com>
-").unwrap();
-        line.clear(); reader.read_line(&mut line).unwrap();
+        writer
+            .write_all(
+                b"RCPT TO:<c@d.com>
+",
+            )
+            .unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
 
-        writer.write_all(b"DATA
-").unwrap();
-        line.clear(); reader.read_line(&mut line).unwrap();
+        writer
+            .write_all(
+                b"DATA
+",
+            )
+            .unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
         assert!(line.starts_with("354 "));
 
         // Send partial data and drop connection without terminator
-writer.write_all(b"Incomplete message...\r\n").unwrap();
+        writer.write_all(b"Incomplete message...\r\n").unwrap();
         drop(writer);
         drop(reader);
 
-for _ in 0..50 {
+        for _ in 0..50 {
             let entries: Vec<_> = fs::read_dir(&config.spool_dir).unwrap().collect();
             if entries.is_empty() {
                 break;
@@ -764,7 +925,7 @@ for _ in 0..50 {
             thread::sleep(Duration::from_millis(10));
         }
 
-let entries: Vec<_> = fs::read_dir(&config.spool_dir).unwrap().collect();
+        let entries: Vec<_> = fs::read_dir(&config.spool_dir).unwrap().collect();
         assert_eq!(entries.len(), 0);
 
         let _ = fs::remove_dir_all(&config.spool_dir);
