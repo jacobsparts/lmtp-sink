@@ -15,26 +15,34 @@ pub struct Config {
     pub lhlo_name: String,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Config {
-            spool_dir: PathBuf::from("/var/spool/lmtp-sink"),
-            host: "10.7.1.3".to_string(),
-            port: 24,
-            lhlo_name: "mail.jacobstoner.com".to_string(),
+fn get_system_hostname() -> Option<String> {
+    let mut buf = vec![0u8; 256];
+    let res = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+    if res == 0 {
+        let c_str = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr() as *const libc::c_char) };
+        if let Ok(s) = c_str.to_str() {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() && trimmed != "localhost" {
+                return Some(trimmed.to_string());
+            }
         }
     }
+    None
 }
 
 fn parse_args() -> Config {
-    let mut config = Config::default();
+    let mut spool_dir = PathBuf::from("/var/spool/lmtp-sink");
+    let mut host: Option<String> = None;
+    let mut port: u16 = 24;
+    let mut lhlo_name: Option<String> = None;
+
     let args: Vec<String> = env::args().collect();
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "-s" | "--spool-dir" => {
                 if i + 1 < args.len() {
-                    config.spool_dir = PathBuf::from(&args[i + 1]);
+                    spool_dir = PathBuf::from(&args[i + 1]);
                     i += 1;
                 } else {
                     eprintln!("Error: --spool-dir requires an argument");
@@ -43,7 +51,7 @@ fn parse_args() -> Config {
             }
             "-H" | "--host" => {
                 if i + 1 < args.len() {
-                    config.host = args[i + 1].clone();
+                    host = Some(args[i + 1].clone());
                     i += 1;
                 } else {
                     eprintln!("Error: --host requires an argument");
@@ -52,7 +60,7 @@ fn parse_args() -> Config {
             }
             "-p" | "--port" => {
                 if i + 1 < args.len() {
-                    config.port = args[i + 1].parse().unwrap_or_else(|_| {
+                    port = args[i + 1].parse().unwrap_or_else(|_| {
                         eprintln!("Error: Invalid port number");
                         process::exit(1);
                     });
@@ -64,7 +72,7 @@ fn parse_args() -> Config {
             }
             "-n" | "--lhlo-name" => {
                 if i + 1 < args.len() {
-                    config.lhlo_name = args[i + 1].clone();
+                    lhlo_name = Some(args[i + 1].clone());
                     i += 1;
                 } else {
                     eprintln!("Error: --lhlo-name requires an argument");
@@ -72,12 +80,17 @@ fn parse_args() -> Config {
                 }
             }
             "-h" | "--help" => {
-                println!("Usage: lmtp-drain [options]");
-                println!("Options:");
+                println!("Usage: lmtp-drain -H <host> [options]");
+                println!();
+                println!("Required Options:");
+                println!(
+                    "  -H, --host <host-or-address> Destination LMTP host or IP address (Required)"
+                );
+                println!();
+                println!("Other Options:");
+                println!("  -p, --port <port>            Destination LMTP port (default: 24)");
+                println!("  -n, --lhlo-name <name>       Client LHLO hostname (default: dynamically detected system hostname)");
                 println!("  -s, --spool-dir <path>       Spool directory (default: /var/spool/lmtp-sink)");
-                println!("  -H, --host <host-or-address> LMTP host (default: 10.7.1.3)");
-                println!("  -p, --port <port>            LMTP port (default: 24)");
-                println!("  -n, --lhlo-name <name>       Client LHLO hostname (default: mail.jacobstoner.com)");
                 println!("  -h, --help                   Show this help message");
                 process::exit(0);
             }
@@ -88,7 +101,35 @@ fn parse_args() -> Config {
         }
         i += 1;
     }
-    config
+
+    let host = match host {
+        Some(h) => h,
+        None => {
+            eprintln!("Error: Missing required option: -H, --host <host-or-address>");
+            eprintln!("Run 'lmtp-drain --help' for usage instructions.");
+            process::exit(1);
+        }
+    };
+
+    let lhlo_name = match lhlo_name {
+        Some(n) => n,
+        None => {
+            match get_system_hostname() {
+                Some(hn) => hn,
+                None => {
+                    eprintln!("Error: Unable to detect system hostname; -n, --lhlo-name <name> is required");
+                    process::exit(1);
+                }
+            }
+        }
+    };
+
+    Config {
+        spool_dir,
+        host,
+        port,
+        lhlo_name,
+    }
 }
 
 struct LockFile {
@@ -312,33 +353,92 @@ impl LmtpClient {
 
     fn read_response(&mut self) -> Result<(u16, String), ResponseError> {
         let mut full_resp = String::new();
+        let mut expected_code: Option<u16> = None;
+
         loop {
-            let mut line = String::new();
-            let n = self.reader.read_line(&mut line).map_err(|e| {
-                ResponseError::Network(format!("Network error reading LMTP response: {}", e))
-            })?;
+            let mut line_bytes = Vec::new();
+            let n = self
+                .reader
+                .read_until(b'\n', &mut line_bytes)
+                .map_err(|e| {
+                    ResponseError::Network(format!("Network error reading LMTP response: {}", e))
+                })?;
+
             if n == 0 {
                 return Err(ResponseError::Network(
                     "Network error: unexpected EOF reading response".to_string(),
                 ));
             }
 
-            full_resp.push_str(&line);
-            if line.len() >= 4 {
-                let code_str = &line[..3];
-                let sep = line.as_bytes()[3];
-                if let Ok(code) = code_str.parse::<u16>() {
-                    if sep == b' ' {
-                        return Ok((code, full_resp));
-                    } else if sep == b'-' {
-                        continue;
-                    }
-                }
+            if line_bytes.len() < 3 {
+                let lossy = String::from_utf8_lossy(&line_bytes);
+                return Err(ResponseError::Protocol(format!(
+                    "Malformed LMTP response (too short): {}",
+                    lossy.trim()
+                )));
             }
-            return Err(ResponseError::Protocol(format!(
-                "Malformed LMTP response: {}",
-                line.trim()
-            )));
+
+            if !line_bytes[0].is_ascii_digit()
+                || !line_bytes[1].is_ascii_digit()
+                || !line_bytes[2].is_ascii_digit()
+            {
+                let lossy = String::from_utf8_lossy(&line_bytes);
+                return Err(ResponseError::Protocol(format!(
+                    "Malformed LMTP response status code: {}",
+                    lossy.trim()
+                )));
+            }
+
+            let code = ((line_bytes[0] - b'0') as u16) * 100
+                + ((line_bytes[1] - b'0') as u16) * 10
+                + ((line_bytes[2] - b'0') as u16);
+
+            if !(200..=599).contains(&code) {
+                let lossy = String::from_utf8_lossy(&line_bytes);
+                return Err(ResponseError::Protocol(format!(
+                    "Invalid LMTP response status code (out of range {}): {}",
+                    code,
+                    lossy.trim()
+                )));
+            }
+
+            if let Some(exp) = expected_code {
+                if code != exp {
+                    let lossy = String::from_utf8_lossy(&line_bytes);
+                    return Err(ResponseError::Protocol(format!(
+                        "Mismatched multiline response status code (expected {}, got {}): {}",
+                        exp,
+                        code,
+                        lossy.trim()
+                    )));
+                }
+            } else {
+                expected_code = Some(code);
+            }
+
+            let is_continuation = if line_bytes.len() >= 4 {
+                let sep = line_bytes[3];
+                if sep == b'-' {
+                    true
+                } else if sep == b' ' || sep == b'\r' || sep == b'\n' {
+                    false
+                } else {
+                    let lossy = String::from_utf8_lossy(&line_bytes);
+                    return Err(ResponseError::Protocol(format!(
+                        "Malformed LMTP response separator byte: {}",
+                        lossy.trim()
+                    )));
+                }
+            } else {
+                false
+            };
+
+            let lossy_line = String::from_utf8_lossy(&line_bytes);
+            full_resp.push_str(&lossy_line);
+
+            if !is_continuation {
+                return Ok((code, full_resp));
+            }
         }
     }
 
@@ -703,7 +803,7 @@ mod tests {
     use std::thread;
 
     fn setup_mock_dovecot(
-        behavior: Arc<std::sync::Mutex<Vec<String>>>,
+        behavior: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
     ) -> (Config, String, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -743,10 +843,10 @@ mod tests {
                     };
 
                     if let Some(resp) = response_override {
-                        if resp == "DROP" {
+                        if resp == b"DROP" {
                             break;
                         }
-                        let _ = stream.write_all(resp.as_bytes());
+                        let _ = stream.write_all(&resp);
                         let _ = stream.flush();
                         continue;
                     }
@@ -862,7 +962,7 @@ mod tests {
         behavior
             .lock()
             .unwrap()
-            .push("550 5.1.1 User unknown\r\n".to_string());
+            .push(b"550 5.1.1 User unknown\r\n".to_vec());
 
         let res = deliver_record(&mut client, &spool_file, &parsed);
         assert!(matches!(res, DeliverResult::LmtpRejected(_)));
@@ -894,7 +994,57 @@ mod tests {
         behavior
             .lock()
             .unwrap()
-            .push("this is not LMTP\r\n".to_string());
+            .push(b"this is not LMTP\r\n".to_vec());
+
+        let res = deliver_record(&mut client, &spool_file, &parsed);
+        assert!(matches!(res, DeliverResult::LmtpRejected(_)));
+
+        let _ = fs::remove_dir_all(&config.spool_dir);
+    }
+
+    #[test]
+    fn test_multiline_status_mismatch_becomes_rejected() {
+        let behavior = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (config, _addr, _handle) = setup_mock_dovecot(behavior.clone());
+
+        let sample_path = Path::new("sample.spool");
+        let parsed = parse_record(sample_path).unwrap().unwrap();
+
+        let spool_file = config.spool_dir.join("20260321T041523123456Z.spool");
+        fs::copy(sample_path, &spool_file).unwrap();
+
+        let mut client = LmtpClient::connect(&config).unwrap();
+
+        // Push multiline mismatch 550-first / 250 final for MAIL FROM
+        behavior
+            .lock()
+            .unwrap()
+            .push(b"550-first line\r\n250 final line\r\n".to_vec());
+
+        let res = deliver_record(&mut client, &spool_file, &parsed);
+        assert!(matches!(res, DeliverResult::LmtpRejected(_)));
+
+        let _ = fs::remove_dir_all(&config.spool_dir);
+    }
+
+    #[test]
+    fn test_invalid_utf8_response_becomes_rejected() {
+        let behavior = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (config, _addr, _handle) = setup_mock_dovecot(behavior.clone());
+
+        let sample_path = Path::new("sample.spool");
+        let parsed = parse_record(sample_path).unwrap().unwrap();
+
+        let spool_file = config.spool_dir.join("20260321T041523123456Z.spool");
+        fs::copy(sample_path, &spool_file).unwrap();
+
+        let mut client = LmtpClient::connect(&config).unwrap();
+
+        // Push invalid UTF-8 bytes response for MAIL FROM
+        behavior
+            .lock()
+            .unwrap()
+            .push(vec![0x35, 0x35, 0x30, 0x20, 0xFF, 0xFE, 0x0D, 0x0A]); // "550 \xFF\xFE\r\n"
 
         let res = deliver_record(&mut client, &spool_file, &parsed);
         assert!(matches!(res, DeliverResult::LmtpRejected(_)));

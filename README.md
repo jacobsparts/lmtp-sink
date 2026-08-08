@@ -84,13 +84,15 @@ Then reload Postfix (`postfix reload`).
 ### `lmtp-drain` Usage
 
 ```text
-lmtp-drain [options]
+lmtp-drain -H <host> [options]
 
-Options:
+Required Options:
+  -H, --host <host-or-address> Destination LMTP host or IP address (Required)
+
+Other Options:
+  -p, --port <port>            Destination LMTP port (default: 24)
+  -n, --lhlo-name <name>       Client LHLO hostname (default: dynamically detected system hostname)
   -s, --spool-dir <path>       Spool directory (default: /var/spool/lmtp-sink)
-  -H, --host <host-or-address> LMTP host (default: 10.7.1.3)
-  -p, --port <port>            LMTP port (default: 24)
-  -n, --lhlo-name <name>       Client LHLO hostname (default: mail.jacobstoner.com)
   -h, --help                   Show help message
 ```
 
