@@ -137,8 +137,8 @@ UUIDs and random filename components are not required.
 Each completed spool file shall contain:
 
     MAIL FROM:<sender@example.org>
-    RCPT TO:<jacob@roundcube.jphq.net>
-    RCPT TO:<support@roundcube.jphq.net>
+    RCPT TO:<jacob@example.org>
+    RCPT TO:<support@example.org>
     RECEIVED AT:2026-03-21T04:15:23.123456Z
 
     [unescaped message bytes]
@@ -154,7 +154,7 @@ The exact layout is:
 Example with a null envelope sender:
 
     MAIL FROM:<>
-    RCPT TO:<jacob@roundcube.jphq.net>
+    RCPT TO:<jacob@example.org>
     RECEIVED AT:2026-03-21T04:15:23.123456Z
 
     [unescaped message bytes]
@@ -162,7 +162,7 @@ Example with a null envelope sender:
 The sink shall preserve any parameters present in the accepted envelope command arguments. For example:
 
     MAIL FROM:<sender@example.org> SIZE=12345 BODY=8BITMIME
-    RCPT TO:<jacob@roundcube.jphq.net> NOTIFY=FAILURE
+    RCPT TO:<jacob@example.org> NOTIFY=FAILURE
 
 The custom envelope preamble is not part of the original email message. The stored format is deliberately private and need not conform to mbox, Maildir, or RFC message-file conventions.
 

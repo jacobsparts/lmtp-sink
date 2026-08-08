@@ -6,7 +6,7 @@ The LMTP sink drainer is a small, one-shot utility that recovers completed sink 
 
 The intended topology is:
 
-    Postfix -> Dovecot LMTP at 10.7.1.3:24
+    Postfix -> Dovecot LMTP at <dovecot-host>:24
 
 When Dovecot is unreachable:
 
@@ -16,9 +16,9 @@ Recovery path:
 
     periodic cron or systemd timer
         -> lmtp-drain
-        -> Dovecot LMTP at 10.7.1.3:24
+        -> Dovecot LMTP at <dovecot-host>:24
 
-The drainer exists specifically to mitigate an unavailable downstream host. Once Postfix has routed a message to `roundcube.jphq.net`, that message is expected to be deliverable by Dovecot.
+The drainer exists specifically to mitigate an unavailable downstream host. Once Postfix has routed a message to `<private-mail-domain>`, that message is expected to be deliverable by Dovecot.
 
 The drainer is not a general-purpose MTA or SMTP-style deferred-delivery queue. It does not interpret LMTP rejections as reasons to schedule repeated delivery attempts. Only network failures leave a record pending for a later run.
 
@@ -97,9 +97,9 @@ Scheduling is external, normally through cron or a systemd timer.
 Defaults:
 
     spool directory:  /var/spool/lmtp-sink
-    LMTP host:        10.7.1.3
+    LMTP host:        <dovecot-host> (Required CLI parameter)
     LMTP port:        24
-    client LHLO name: mail.jacobstoner.com
+    client LHLO name: <mail-server-hostname> (default: dynamically detected system hostname)
 
 Suggested command-line interface:
 
@@ -158,8 +158,8 @@ The sink does not need to participate in this lock. It publishes completed recor
 Each input record has this layout:
 
     MAIL FROM:<sender@example.org> SIZE=488 BODY=8BITMIME
-    RCPT TO:<jacob@roundcube.jphq.net>
-    RCPT TO:<support@roundcube.jphq.net>
+    RCPT TO:<jacob@<private-mail-domain>>
+    RCPT TO:<support@<private-mail-domain>>
     RECEIVED AT:2026-03-21T04:15:23.123456Z
 
     [unescaped message bytes]
@@ -182,8 +182,8 @@ The sink stores the complete arguments from the original LMTP commands. Examples
 
     MAIL FROM:<sender@example.org> SIZE=488 BODY=8BITMIME
     MAIL FROM:<>
-    RCPT TO:<jacob@roundcube.jphq.net>
-    RCPT TO:<support@roundcube.jphq.net> NOTIFY=FAILURE
+    RCPT TO:<jacob@<private-mail-domain>>
+    RCPT TO:<support@<private-mail-domain>> NOTIFY=FAILURE
 
 The drainer shall extract the path enclosed by the first `<` and its matching `>` from each envelope line.
 
@@ -195,8 +195,8 @@ Examples:
     MAIL FROM:<>
         -> <>
 
-    RCPT TO:<jacob@roundcube.jphq.net> NOTIFY=FAILURE
-        -> <jacob@roundcube.jphq.net>
+    RCPT TO:<jacob@<private-mail-domain>> NOTIFY=FAILURE
+        -> <jacob@<private-mail-domain>>
 
 The initial implementation shall use the extracted reverse-path and forward-path values for delivery and shall not replay stored ESMTP parameters.
 
@@ -243,7 +243,7 @@ If at least one `.spool` record exists, the drainer shall establish the actual L
 2. Read a valid `220` greeting.
 3. Send:
 
-       LHLO mail.jacobstoner.com
+       LHLO <mail-server-hostname>
 
 4. Read a valid complete multiline `250` response.
 
@@ -540,7 +540,7 @@ These are operation timeouts, not message expiration or SMTP-style retry schedul
 
 A typical cron entry is:
 
-    */5 * * * * /usr/local/sbin/lmtp-drain --spool-dir /var/spool/lmtp-sink --host 10.7.1.3 --port 24 --lhlo-name mail.jacobstoner.com
+    */5 * * * * /usr/local/sbin/lmtp-drain --spool-dir /var/spool/lmtp-sink --host <dovecot-host> --port 24 --lhlo-name <mail-server-hostname>
 
 The utility's single-instance lock makes overlapping invocations harmless.
 
@@ -659,4 +659,4 @@ The drainer's policy is:
 
 > Retry only after network failure. Mark malformed or LMTP-rejected records `.failed`. Delete only after every recipient is unambiguously accepted. Abort immediately on filesystem errors.
 
-This policy reflects the system invariant that messages routed to the private `roundcube.jphq.net` Dovecot destination are expected to be deliverable once that downstream host is reachable.
+This policy reflects the system invariant that messages routed to the private `<private-mail-domain>` Dovecot destination are expected to be deliverable once that downstream host is reachable.

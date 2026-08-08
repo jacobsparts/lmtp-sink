@@ -56,7 +56,7 @@ roundcube-lmtp unix - - y - - lmtp
 And in `/etc/postfix/transport`:
 
 ```postfix
-roundcube.jphq.net    roundcube-lmtp:10.7.1.3:24
+<private-mail-domain>    roundcube-lmtp:<dovecot-host>:24
 ```
 
 Then reload Postfix (`postfix reload`).
@@ -101,7 +101,7 @@ Other Options:
 Add a cron entry to run `lmtp-drain` periodically (e.g. every 5 minutes):
 
 ```cron
-*/5 * * * * /usr/local/sbin/lmtp-drain --spool-dir /var/spool/lmtp-sink --host 10.7.1.3 --port 24 --lhlo-name mail.jacobstoner.com
+*/5 * * * * /usr/local/sbin/lmtp-drain --spool-dir /var/spool/lmtp-sink --host <dovecot-host> --port 24 --lhlo-name <mail-server-hostname>
 ```
 
 ---
@@ -112,8 +112,8 @@ Spool files reside in `/var/spool/lmtp-sink/`:
 
 ```text
 MAIL FROM:<sender@example.org> SIZE=12345 BODY=8BITMIME
-RCPT TO:<jacob@roundcube.jphq.net>
-RCPT TO:<support@roundcube.jphq.net>
+RCPT TO:<jacob@example.org>
+RCPT TO:<support@example.org>
 RECEIVED AT:2026-03-21T04:15:23.123456Z
 
 [unescaped message bytes]
