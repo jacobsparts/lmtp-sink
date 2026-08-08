@@ -3,6 +3,14 @@ name = "lmtp-sink"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "lmtp-sink"
+path = "src/main.rs"
+
+[[bin]]
+name = "lmtp-drain"
+path = "src/drain_main.rs"
+
 [dependencies]
 chrono = "0.4.45"
 libc = "0.2.189"

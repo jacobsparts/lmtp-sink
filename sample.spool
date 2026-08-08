@@ -1,0 +1,21 @@
+MAIL FROM:<sender@example.org> SIZE=488 BODY=8BITMIME
+RCPT TO:<jacob@roundcube.jphq.net>
+RCPT TO:<support@roundcube.jphq.net>
+RECEIVED AT:2026-03-21T04:15:23.123456Z
+
+Date: Sat, 21 Mar 2026 04:15:22 +0000
+From: Example Sender <sender@example.org>
+To: Jacob <jacob@roundcube.jphq.net>
+Cc: Support <support@roundcube.jphq.net>
+Subject: Sample emergency-spool message
+Message-ID: <sample-lmtp-drain-20260321@example.org>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This is a sample message stored by lmtp-sink.
+
+The next line begins with one literal dot:
+.leading-dot
+
+It must be dot-stuffed again when transmitted through LMTP.
