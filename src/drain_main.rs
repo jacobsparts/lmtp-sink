@@ -20,9 +20,9 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             spool_dir: PathBuf::from("/var/spool/lmtp-sink"),
-            host: "10.7.1.3".to_string(),
+            host: "127.0.0.1".to_string(),
             port: 24,
-            lhlo_name: "mail.jacobstoner.com".to_string(),
+            lhlo_name: "localhost".to_string(),
         }
     }
 }
@@ -76,9 +76,9 @@ fn parse_args() -> Config {
                 println!("Usage: lmtp-drain [options]");
                 println!("Options:");
                 println!("  -s, --spool-dir <path>       Spool directory (default: /var/spool/lmtp-sink)");
-                println!("  -H, --host <host-or-address> LMTP host (default: 10.7.1.3)");
+                println!("  -H, --host <host-or-address> LMTP host (default: 127.0.0.1)");
                 println!("  -p, --port <port>            LMTP port (default: 24)");
-                println!("  -n, --lhlo-name <name>       Client LHLO hostname (default: mail.jacobstoner.com)");
+                println!("  -n, --lhlo-name <name>       Client LHLO hostname (default: localhost)");
                 println!("  -h, --help                   Show this help message");
                 process::exit(0);
             }
@@ -165,7 +165,7 @@ fn find_spool_records(spool_dir: &Path) -> Result<Vec<PathBuf>, String> {
 #[derive(Debug)]
 struct ParsedRecord {
     sender_path: String,     // e.g. "<sender@example.org>" or "<>"
-    rcpt_paths: Vec<String>, // e.g. ["<jacob@roundcube.jphq.net>"]
+    rcpt_paths: Vec<String>, // e.g. ["<user@example.com>"]
     header_byte_len: u64,    // offset in bytes where message content begins
 }
 
@@ -761,8 +761,8 @@ mod tests {
         assert_eq!(
             parsed.rcpt_paths,
             vec![
-                "<jacob@roundcube.jphq.net>".to_string(),
-                "<support@roundcube.jphq.net>".to_string()
+                "<jacob@example.org>".to_string(),
+                "<support@example.org>".to_string()
             ]
         );
 
