@@ -15,7 +15,7 @@ It is designed specifically to serve as Postfix's `lmtp_fallback_relay`. It acce
   - Returns `250` success responses to the LMTP client *only* after directory synchronization completes.
 - **Free-Space Protection**: Performs a pre-`DATA` filesystem space check (`statvfs`) and rejects `DATA` with `452 4.3.1 Insufficient system storage` if available disk space is below the configured threshold (default 100 MiB).
 - **Dot-Stuffing Handling**: Reconstructs original message data by removing LMTP dot-stuffing (`..` -> `.`) while preserving received line endings.
-- **Zero External Dependencies**: Can be compiled as a static i686/x86_64 binary using `musl`, running efficiently on unprivileged system accounts with low memory footprint (< 1 MB).
+- **No Runtime Shared-Library Dependencies**: Can be compiled as a static i686/x86_64 binary using `musl` and run as an unprivileged system account.
 
 ## Spool Record Format
 
@@ -54,7 +54,7 @@ Options:
 To configure Postfix to use `lmtp-sink` as a fallback relay when your primary LMTP server (e.g. Dovecot) is unavailable, add the following to `/etc/postfix/main.cf`:
 
 ```postfix
-lmtp_fallback_relay = inet:127.0.0.1:2526
+lmtp_fallback_relay = 127.0.0.1:2526
 ```
 
 Then reload Postfix:
